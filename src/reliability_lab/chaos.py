@@ -82,7 +82,7 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        if result.route.startswith("fallback"):
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
         elif result.route == "static_fallback":
@@ -118,7 +118,19 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
 
         # TODO(student): Define pass/fail criteria per scenario.
         # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        passed = False
+        if scenario.name == "primary_timeout_100":
+            success_rate = result.successful_requests / max(1, result.total_requests)
+            passed = success_rate > 0.9
+        elif scenario.name == "primary_flaky_50":
+            passed = result.circuit_open_count > 0 and result.successful_requests > 0
+        elif scenario.name == "all_healthy":
+            passed = (result.successful_requests / max(1, result.total_requests)) > 0.95
+        elif scenario.name == "cache_stale_candidate":
+            passed = result.successful_requests > 0
+        else:
+            passed = result.successful_requests > 0
+            
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests

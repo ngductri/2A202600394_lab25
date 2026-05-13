@@ -55,8 +55,12 @@ class ResponseCache:
         self._entries: list[CacheEntry] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
+
         best_value: str | None = None
         best_score = 0.0
+        best_key = ""
         now = time.time()
         self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
         for entry in self._entries:
@@ -64,11 +68,17 @@ class ResponseCache:
             if score > best_score:
                 best_score = score
                 best_value = entry.value
+                best_key = entry.key
+                
         if best_score >= self.similarity_threshold:
+            if _looks_like_false_hit(query, best_key):
+                return None, best_score
             return best_value, best_score
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        if _is_uncacheable(query):
+            return
         self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
@@ -77,8 +87,15 @@ class ResponseCache:
 
         TODO(student): Improve with embeddings or a deterministic vectorizer.
         """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
+        if a.lower() == b.lower():
+            return 1.0
+            
+        def get_trigrams(text):
+            text = text.lower()
+            return set(text[i:i+3] for i in range(len(text)-2))
+            
+        left = get_trigrams(a)
+        right = get_trigrams(b)
         if not left or not right:
             return 0.0
         return len(left & right) / len(left | right)
@@ -146,7 +163,38 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        try:
+            if _is_uncacheable(query):
+                return None, 0.0
+                
+            key = f"{self.prefix}{self._query_hash(query)}"
+            exact_match = self._redis.hget(key, "response")
+            if exact_match is not None:
+                return exact_match, 1.0
+                
+            best_value: str | None = None
+            best_score = 0.0
+            best_key = ""
+            
+            for k in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(k, "query")
+                if cached_query is None:
+                    continue
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_value = self._redis.hget(k, "response")
+                    best_key = cached_query
+                    
+            if best_score >= self.similarity_threshold:
+                if _looks_like_false_hit(query, best_key):
+                    self.false_hit_log.append({"query": query, "cached_query": best_key, "score": best_score})
+                    return None, best_score
+                return best_value, best_score
+                
+            return None, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +205,14 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        try:
+            if _is_uncacheable(query):
+                return
+            key = f"{self.prefix}{self._query_hash(query)}"
+            self._redis.hset(key, mapping={"query": query, "response": value})
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            pass
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
